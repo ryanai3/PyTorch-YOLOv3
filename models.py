@@ -11,6 +11,7 @@ from PIL import Image
 from utils.parse_config import *
 from utils.utils import build_targets
 from collections import defaultdict
+from layers.transformer import TransformerEncoder
 
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
@@ -84,15 +85,33 @@ def create_modules(module_defs):
       # Define detection layer
       yolo_layer = YOLOLayer(anchors, num_classes, img_height)
       modules.add_module("yolo_%d" % i, yolo_layer)
+
     elif module_def["type"] == 'transformer':
-      in_channels = output_filters[-1]
-      filters = int(module_def["out_filters"])
-      modules.add_module("transformer_%d" % i, EmptyLayer())
+      mod = TransformerEncoder(
+        n_layers = int(module_def["n_layers"]),
+        n_head = int(module_def["n_head"]),
+        d_model = output_filters[-1],
+        d_k = int(module_def["d_k"]),
+        d_v = int(module_def["d_v"]),
+        mha_drop_prob = float(module_def["mha_dp"]),
+        sdpa_drop_prob = float(module_def["sdpa_dp"]),
+        d_ff = int(module_def["d_ff"]),
+        pos_ffn_drop_prob = float(module_def["ff_dp"]),
+      )
+      modules.add_module("transf_%d" % i, mod)
+      filters = output_filters[-1]
+#      filters = int(module_def["out_filters"])
 
     # Register module list and number of output filters
     module_list.append(modules)
     output_filters.append(filters)
-
+  print("freezing layers!")
+  print("\n\n\n\n\n\n\n\n===========\n\n\n\n\n\n")
+  for module_def, module in zip(module_defs, module_list):
+    if "learnable" not in module_def:
+      print(module)
+      for p in module.parameters():
+        p.requires_grad = False
   return hyperparams, module_list
 
 
@@ -178,7 +197,7 @@ class YOLOLayer(nn.Module):
 
       nProposals = int((pred_conf > 0.5).sum().item())
       recall = float(nCorrect / nGT) if nGT else 1
-      precision = float(nCorrect / nProposals)
+      precision = float(nCorrect / (nProposals + 1e-6))
 
       # Handle masks
       mask = Variable(mask.type(ByteTensor))
@@ -250,7 +269,8 @@ class Darknet(nn.Module):
     layer_outputs = []
     for i, (module_def, module) in enumerate(zip(self.module_defs, self.module_list)):
 #      print(module)
-      with torch.set_grad_enabled("learnable" in module_def):
+#      with torch.set_grad_enabled("learnable" in module_def):
+      with torch.set_grad_enabled(True):
         if module_def["type"] in ["convolutional", "upsample", "maxpool"]:
           x = module(x)
         elif module_def["type"] == "route":
@@ -274,8 +294,7 @@ class Darknet(nn.Module):
             x = module(x)
           output.append(x)
         elif module_def["type"] == "transformer":
-          x = x
-#          x = module(x)
+          x = module(x)
         layer_outputs.append(x)
 
     self.losses["recall"] /= 3
@@ -332,7 +351,7 @@ class Darknet(nn.Module):
           conv_layer.weight.data.copy_(conv_w)
           ptr += num_w
     else:
-      self.load_state_dict(torch.load(weights_path))
+      self.load_state_dict(torch.load(weights_path), strict=False)
 
   """
     @:param path    - path of the new weights file
@@ -364,3 +383,46 @@ class Darknet(nn.Module):
       fp.close()
     else:
       torch.save(self.state_dict(), path)
+
+class PreproDarknet(Darknet):
+
+  def forward(self, x, targets=None):
+    is_training = targets is not None
+    output = []
+    self.losses = defaultdict(float)
+    layer_outputs = []
+    results = {}
+    for i, (module_def, module) in enumerate(zip(self.module_defs, self.module_list)):
+#      print(module)
+#      with torch.set_grad_enabled("learnable" in module_def):
+      with torch.no_grad():
+        if module_def["type"] in ["convolutional", "upsample", "maxpool"]:
+          x = module(x)
+        elif module_def["type"] == "route":
+          layer_i = [int(x) for x in module_def["layers"].split(",")]
+          try:
+           x = torch.cat([layer_outputs[i] for i in layer_i], 1)
+          except:
+           import pdb; pdb.set_trace()
+           print(32)
+        elif module_def["type"] == "shortcut":
+          layer_i = int(module_def["from"])
+          x = layer_outputs[-1] + layer_outputs[layer_i]
+        elif module_def["type"] == "yolo":
+          # Train phase: get loss
+          if is_training:
+            x, *losses = module[0](x, targets)
+            for name, loss in zip(self.loss_names, losses):
+              self.losses[name] += loss
+          # Test phase: Get detections
+          else:
+            x = module(x)
+          output.append(x)
+        elif module_def["type"] == "transformer":
+          x = module(x)
+        layer_outputs.append(x)
+        if "featurize" in module_def:
+          results["{0}_{1}".format(i, module_def["type"])] = x
+    self.losses["recall"] /= 3
+    self.losses["precision"] /= 3
+    return results
